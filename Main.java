@@ -113,12 +113,22 @@ public class Main extends JFrame {
 
     private boolean timerRunning = false;
 
+    /*
+     * Timer accuracy:
+     * elapsed time is accumulated from real monotonic time.
+     * This prevents the saved session from depending on how often
+     * Swing's UI timer happens to fire.
+     */
+    private long accumulatedElapsedNanos = 0L;
+    private long segmentStartNanos = 0L;
+
     private LocalDateTime timerStartTime;
 
-    // Real timer deadline. Because this uses System.nanoTime(),
-    // the timer keeps counting while this window is unfocused
-    // or minimized.
-    private long timerEndNanos = 0L;
+    /*
+     * Prevents the same timer session from being written to SQLite
+     * more than once.
+     */
+    private boolean sessionSaved = false;
 
     // =========================================================
     // PROGRESS
@@ -3303,7 +3313,10 @@ public class Main extends JFrame {
             return;
         }
 
-        // First Start: read the duration.
+        /*
+         * First start of a new session.
+         * remainingSeconds == 0 means there is no active/paused session.
+         */
         if (remainingSeconds == 0) {
 
             try {
@@ -3329,7 +3342,12 @@ public class Main extends JFrame {
                 remainingSeconds = plannedSeconds;
                 elapsedSeconds = 0;
 
+                accumulatedElapsedNanos = 0L;
+                segmentStartNanos = 0L;
+
                 timerStartTime = LocalDateTime.now();
+
+                sessionSaved = false;
 
             } catch (NumberFormatException e) {
 
@@ -3342,12 +3360,11 @@ public class Main extends JFrame {
             }
         }
 
-        // Create a real-time deadline for the remaining duration.
-        // This is independent of whether the Swing window has focus.
-        timerEndNanos =
-                System.nanoTime()
-                        + (remainingSeconds * 1_000_000_000L);
-
+        /*
+         * Start a new real-time segment.
+         * For a resume, the already accumulated time is preserved.
+         */
+        segmentStartNanos = System.nanoTime();
         timerRunning = true;
 
         startButton.setEnabled(false);
@@ -3356,8 +3373,10 @@ public class Main extends JFrame {
 
         if (swingTimer == null) {
 
-            // UI refresh only. The actual time is calculated from
-            // System.nanoTime(), so missed UI ticks cannot lose time.
+            /*
+             * Swing Timer is ONLY for refreshing the display.
+             * It is NOT responsible for measuring elapsed time.
+             */
             swingTimer =
                     new Timer(
                             250,
@@ -3384,24 +3403,52 @@ public class Main extends JFrame {
             return;
         }
 
-        long remainingNanos =
-                timerEndNanos - System.nanoTime();
+        long nowNanos = System.nanoTime();
 
-        if (remainingNanos <= 0) {
+        long currentSegmentNanos =
+                Math.max(
+                        0L,
+                        nowNanos - segmentStartNanos
+                );
 
-            remainingSeconds = 0;
+        long totalElapsedNanos =
+                accumulatedElapsedNanos
+                        + currentSegmentNanos;
+
+        int calculatedElapsedSeconds =
+                (int) Math.min(
+                        plannedSeconds,
+                        totalElapsedNanos / 1_000_000_000L
+                );
+
+        elapsedSeconds =
+                Math.max(
+                        0,
+                        calculatedElapsedSeconds
+                );
+
+        remainingSeconds =
+                Math.max(
+                        0,
+                        plannedSeconds - elapsedSeconds
+                );
+
+        if (elapsedSeconds >= plannedSeconds) {
+
             elapsedSeconds = plannedSeconds;
+            remainingSeconds = 0;
 
             if (swingTimer != null) {
                 swingTimer.stop();
             }
 
             timerRunning = false;
+            accumulatedElapsedNanos = 0L;
+            segmentStartNanos = 0L;
 
             saveCurrentSession("Completed");
 
-            resetTimer();
-
+            updateTimerLabel();
             updateAllProgress();
 
             JOptionPane.showMessageDialog(
@@ -3409,19 +3456,9 @@ public class Main extends JFrame {
                     "Timer completed!"
             );
 
+            resetTimer();
             return;
         }
-
-        remainingSeconds =
-                (int) Math.ceil(
-                        remainingNanos / 1_000_000_000.0
-                );
-
-        elapsedSeconds =
-                Math.max(
-                        0,
-                        plannedSeconds - remainingSeconds
-                );
 
         updateTimerLabel();
     }
@@ -3436,26 +3473,31 @@ public class Main extends JFrame {
             return;
         }
 
-        // Capture exact remaining time before pausing.
-        long remainingNanos =
-                timerEndNanos - System.nanoTime();
+        long nowNanos = System.nanoTime();
+
+        long currentSegmentNanos =
+                Math.max(
+                        0L,
+                        nowNanos - segmentStartNanos
+                );
+
+        accumulatedElapsedNanos += currentSegmentNanos;
+
+        elapsedSeconds =
+                (int) Math.min(
+                        plannedSeconds,
+                        accumulatedElapsedNanos
+                                / 1_000_000_000L
+                );
 
         remainingSeconds =
                 Math.max(
                         0,
-                        (int) Math.ceil(
-                                remainingNanos
-                                        / 1_000_000_000.0
-                        )
-                );
-
-        elapsedSeconds =
-                Math.max(
-                        0,
-                        plannedSeconds - remainingSeconds
+                        plannedSeconds - elapsedSeconds
                 );
 
         timerRunning = false;
+        segmentStartNanos = 0L;
 
         if (swingTimer != null) {
             swingTimer.stop();
@@ -3476,23 +3518,27 @@ public class Main extends JFrame {
 
         if (timerRunning) {
 
-            // Capture exact elapsed time before saving.
-            long remainingNanos =
-                    timerEndNanos - System.nanoTime();
+            long nowNanos = System.nanoTime();
+
+            long currentSegmentNanos =
+                    Math.max(
+                            0L,
+                            nowNanos - segmentStartNanos
+                    );
+
+            accumulatedElapsedNanos += currentSegmentNanos;
+
+            elapsedSeconds =
+                    (int) Math.min(
+                            plannedSeconds,
+                            accumulatedElapsedNanos
+                                    / 1_000_000_000L
+                    );
 
             remainingSeconds =
                     Math.max(
                             0,
-                            (int) Math.ceil(
-                                    remainingNanos
-                                            / 1_000_000_000.0
-                            )
-                    );
-
-            elapsedSeconds =
-                    Math.max(
-                            0,
-                            plannedSeconds - remainingSeconds
+                            plannedSeconds - elapsedSeconds
                     );
         }
 
@@ -3507,12 +3553,12 @@ public class Main extends JFrame {
         }
 
         timerRunning = false;
+        segmentStartNanos = 0L;
 
         saveCurrentSession("Stopped");
 
-        resetTimer();
-
         updateAllProgress();
+        resetTimer();
     }
 
     // =========================================================
@@ -3522,8 +3568,19 @@ public class Main extends JFrame {
     private void saveCurrentSession(
             String status) {
 
+        if (sessionSaved) {
+            return;
+        }
+
         if (currentGoalId == -1 ||
-                timerStartTime == null) {
+                timerStartTime == null ||
+                elapsedSeconds <= 0) {
+
+            return;
+        }
+
+        if (activityCombo == null ||
+                activityCombo.getSelectedItem() == null) {
 
             return;
         }
@@ -3533,15 +3590,26 @@ public class Main extends JFrame {
                         .getSelectedItem()
                         .toString();
 
+        int actualSeconds =
+                Math.max(
+                        0,
+                        Math.min(
+                                plannedSeconds,
+                                elapsedSeconds
+                        )
+                );
+
         DatabaseManager.saveSession(
                 currentGoalId,
                 activity,
                 timerStartTime.toString(),
                 LocalDateTime.now().toString(),
                 plannedSeconds,
-                elapsedSeconds,
+                actualSeconds,
                 status
         );
+
+        sessionSaved = true;
     }
 
     // =========================================================
@@ -3556,8 +3624,10 @@ public class Main extends JFrame {
         elapsedSeconds = 0;
         plannedSeconds = 0;
 
+        accumulatedElapsedNanos = 0L;
+        segmentStartNanos = 0L;
+
         timerStartTime = null;
-        timerEndNanos = 0L;
 
         if (swingTimer != null &&
                 swingTimer.isRunning()) {
@@ -3599,6 +3669,9 @@ public class Main extends JFrame {
 
     // =========================================================
     // ADD CUSTOM TOPIC
+    // =========================================================
+
+    
     // =========================================================
 
     private void addCustomTopic() {
